@@ -1,0 +1,152 @@
+diff --git a/plugins/platforms/slack/adapter.py b/plugins/platforms/slack/adapter.py
+index bf76bd85021a6f18d8ec8807265f768378419112..f1d794a4591a67585e214cd597ca6d633ab32c1e 100644
+--- a/plugins/platforms/slack/adapter.py
++++ b/plugins/platforms/slack/adapter.py
+@@ -2797,10 +2797,13 @@ class SlackAdapter(BasePlatformAdapter):
+             return ""
+         return (
+             f"You are connected to this Slack workspace as the bot "
+-            f'"@{name}". In messages, each line is prefixed with the sender\'s '
+-            f"name, and mentions are shown as @DisplayName. Only treat a "
+-            f'message as directed at you when it mentions "@{name}" '
+-            f"specifically; a mention of any other participant is not a "
++            f'"@{name}". The adapter already applied mention and channel '
++            f"routing; treat every delivered turn as intentionally routed to "
++            f'you. Your routing mention "@{name}" may have been stripped from '
++            f"the visible text — do not reject or ignore a message solely "
++            f'because "@{name}" is absent. In messages, each line is prefixed '
++            f"with the sender's name, and visible mentions are shown as "
++            f"@DisplayName; a mention of any other participant is not a "
+             f"mention of you, even if their name is similar."
+         )
+ 
+diff --git a/tests/gateway/test_slack_routed_identity.py b/tests/gateway/test_slack_routed_identity.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a44804bf16bf522e0e19fb55cd8613bfc726a75e
+--- /dev/null
++++ b/tests/gateway/test_slack_routed_identity.py
+@@ -0,0 +1,124 @@
++"""Synthetic Slack events retain routing identity after own-mention stripping.
++
++Exercise the native adapter constructor and handler with real Slack dependencies.
++Only name lookup and handle_message (the gateway boundary) are faked. The
++unchanged channel-prompt propagation suite separately exercises agent delivery.
++"""
++
++from unittest.mock import AsyncMock
++
++import pytest
++
++from gateway.config import PlatformConfig
++from plugins.platforms.slack.adapter import SlackAdapter
++
++
++@pytest.fixture
++def routed_adapter():
++    adapter = SlackAdapter(PlatformConfig(enabled=True, extra={
++        "require_mention": True,
++        "strict_mention": True,
++        "allowed_channels": ["C000TEST00"],
++        "reactions": False,
++        "channel_prompts": {"C000TEST00": "Synthetic channel guidance"},
++    }))
++    adapter._bot_user_id = "U000SELF00"
++    adapter._bot_display_name = "Fallback Assistant"
++    adapter._team_bot_user_ids = {"T000TEST00": "U000SELF00"}
++    adapter._team_bot_names = {"T000TEST00": "Example Assistant"}
++    adapter._resolve_user_name = AsyncMock(side_effect=lambda uid, **kw: {
++        "U000USER00": "Synthetic Sender", "U000PEER00": "Other Participant",
++        "U000SELF00": "Example Assistant",
++    }.get(uid, uid))
++    adapter.handle_message = AsyncMock()
++    return adapter
++
++
++def _event(text, blocks=None, channel="C000TEST00"):
++    return {
++        "text": text, "blocks": blocks or [], "channel": channel,
++        "channel_type": "channel", "team": "T000TEST00",
++        "user": "U000USER00", "ts": "1700000000.000001",
++    }
++
++
++def _mention_block(kind):
++    return [{"type": "rich_text", "elements": [{
++        "type": kind, "elements": [
++            {"type": "user", "user_id": "U000SELF00"},
++        ],
++    }]}]
++
++
++@pytest.mark.asyncio
++async def test_stripped_mention_keeps_routed_identity_in_channel_prompt(routed_adapter):
++    adapter = routed_adapter
++    await adapter._handle_slack_message(_event(
++        "<@U000SELF00> Please ask <@U000PEER00> to review this."
++    ))
++    adapter.handle_message.assert_awaited_once()
++    event = adapter.handle_message.await_args.args[0]
++    assert event.text == "Please ask @Other Participant to review this."
++    assert event.source.scope_id == "T000TEST00"
++    prompt = event.channel_prompt
++    assert "@Example Assistant" in prompt and "Fallback Assistant" not in prompt
++    assert "Synthetic channel guidance" in prompt
++    assert "adapter already applied mention and channel routing" in prompt, (
++        "Delivered Slack turn lacks adapter-routing guidance"
++    )
++    assert "may have been stripped" in prompt
++    assert "do not reject or ignore a message solely" in prompt
++    assert 'because "@Example Assistant" is absent' in prompt
++    assert "not a mention of you" in prompt
++    assert "Only treat a message as addressed to you" not in prompt
++    assert "Only treat a message as directed at you" not in prompt
++    assert "Synthetic channel guidance" not in event.text
++    assert "@Example Assistant" not in event.text
++    assert event.channel_context is None
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("case", [
++    "unmentioned", "other-only", "quoted-only", "block-only",
++    "stripped-command", "free-response", "mention-disabled", "blocked-channel",
++    "plain-partial-name", "plain-full-name",
++])
++async def test_native_admission_and_command_controls(routed_adapter, case):
++    adapter = routed_adapter
++    event = _event("ordinary synthetic message")
++    if case == "plain-partial-name":
++        event["text"] = "@Example synthetic request"
++    elif case == "plain-full-name":
++        event["text"] = "@Example Assistant synthetic request"
++    elif case == "other-only":
++        event["text"] = "<@U000PEER00> synthetic request"
++    elif case == "quoted-only":
++        event["blocks"] = _mention_block("rich_text_quote")
++    elif case == "block-only":
++        # Only the routing token is block-only; ordinary flat text survives.
++        event["text"] = "synthetic request"
++        event["blocks"] = _mention_block("rich_text_section")
++    elif case == "stripped-command":
++        event["text"] = "<@U000SELF00> /status"
++    elif case == "free-response":
++        adapter.config.extra["free_response_channels"] = ["C000TEST00"]
++    elif case == "mention-disabled":
++        adapter.config.extra["require_mention"] = False
++    elif case == "blocked-channel":
++        event = _event("<@U000SELF00> synthetic request", channel="C000DENY00")
++    await adapter._handle_slack_message(event)
++    if case in {
++        "unmentioned", "other-only", "quoted-only", "blocked-channel",
++        "plain-partial-name", "plain-full-name",
++    }:
++        adapter.handle_message.assert_not_awaited()
++    else:
++        adapter.handle_message.assert_awaited_once()
++        dispatched = adapter.handle_message.await_args.args[0]
++        assert "Synthetic channel guidance" in dispatched.channel_prompt
++        if case == "stripped-command":
++            assert dispatched.text == "/status"
++            assert dispatched.get_command() == "status"
++        if case == "block-only":
++            assert dispatched.text == "synthetic request"
++    assert adapter._mentioned_threads == set()
